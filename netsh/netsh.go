@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"errors"
-
+	"golang.org/x/text/encoding/simplifiedchinese"
 	utilexec "k8s.io/utils/exec"
 )
 
@@ -71,13 +71,13 @@ func New(exec utilexec.Interface) Interface {
 }
 
 func (runner *runner) GetInterfaces() ([]Ipv4Interface, error) {
-	interfaces, interfaceError := runner.getIpAddressConfigurations()
+	interfaces, gbk, interfaceError := runner.getIpAddressConfigurations()
 
 	if interfaceError != nil {
 		return nil, interfaceError
 	}
 
-	indexMap, indexError := runner.getNetworkInterfaceParameters()
+	indexMap, indexError := runner.getNetworkInterfaceParameters(gbk)
 
 	if indexError != nil {
 		return nil, indexError
@@ -98,15 +98,17 @@ func (runner *runner) GetInterfaces() ([]Ipv4Interface, error) {
 }
 
 // GetInterfaces uses the show addresses command and returns a formatted structure
-func (runner *runner) getIpAddressConfigurations() ([]Ipv4Interface, error) {
+func (runner *runner) getIpAddressConfigurations() ([]Ipv4Interface, bool, error) {
+	gbk := false
 	args := []string{
 		"interface", "ipv4", "show", "addresses",
 	}
 
 	output, err := runner.exec.Command(cmdNetsh, args...).CombinedOutput()
 	if err != nil {
-		return nil, err
+		return nil, gbk, err
 	}
+
 	interfacesString := string(output[:])
 
 	outputLines := strings.Split(interfacesString, "\n")
@@ -116,7 +118,7 @@ func (runner *runner) getIpAddressConfigurations() ([]Ipv4Interface, error) {
 	cidrPattern := regexp.MustCompile("\\/(.*?)\\ ")
 
 	if err != nil {
-		return nil, err
+		return nil, gbk, err
 	}
 
 	for _, outputLine := range outputLines {
@@ -160,19 +162,69 @@ func (runner *runner) getIpAddressConfigurations() ([]Ipv4Interface, error) {
 		}
 	}
 
+
+	if len(interfaces) == 0 {
+		gbk = true
+		currentInterface = Ipv4Interface{}
+		interfacesString, err = simplifiedchinese.GBK.NewDecoder().String(string(output[:]))
+		//fmt.Printf("%s \n", interfacesString)
+		outputLines = strings.Split(interfacesString, "\n")
+		for _, outputLine := range outputLines {
+			if strings.Contains(outputLine, "接口") {
+				if currentInterface != (Ipv4Interface{}) {
+					interfaces = append(interfaces, currentInterface)
+				}
+				match := quotedPattern.FindStringSubmatch(outputLine)
+				currentInterface = Ipv4Interface{
+					Name: match[1],
+				}
+			} else {
+				parts := strings.SplitN(outputLine, ":", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				key := strings.TrimSpace(parts[0])
+				value := strings.TrimSpace(parts[1])
+				if strings.HasPrefix(key, "DHCP 已启用") {
+					if value == "Yes" {
+						currentInterface.DhcpEnabled = true
+					}
+				} else if strings.HasPrefix(key, "InterfaceMetric") {
+					if val, err := strconv.Atoi(value); err == nil {
+						currentInterface.InterfaceMetric = val
+					}
+				} else if strings.HasPrefix(key, "网关跃点数") {
+					if val, err := strconv.Atoi(value); err == nil {
+						currentInterface.GatewayMetric = val
+					}
+				} else if strings.HasPrefix(key, "子网前缀") {
+					match := cidrPattern.FindStringSubmatch(value)
+					if val, err := strconv.Atoi(match[1]); err == nil {
+						currentInterface.SubnetPrefix = val
+					}
+				} else if strings.HasPrefix(key, "IP 地址") {
+					currentInterface.IpAddress = value
+				} else if strings.HasPrefix(key, "默认网关") {
+					currentInterface.DefaultGatewayAddress = value
+				}
+			}
+		}
+	}
+
 	// add the last one
 	if currentInterface != (Ipv4Interface{}) {
 		interfaces = append(interfaces, currentInterface)
 	}
 
 	if len(interfaces) == 0 {
-		return nil, fmt.Errorf("no interfaces found in netsh output: %v", interfacesString)
+		return nil, gbk, fmt.Errorf("no interfaces found in netsh output: %v", interfacesString)
 	}
 
-	return interfaces, nil
+	//fmt.Printf("%v", interfaces)
+	return interfaces, gbk, nil
 }
 
-func (runner *runner) getNetworkInterfaceParameters() (map[string]int, error) {
+func (runner *runner) getNetworkInterfaceParameters(gbk bool) (map[string]int, error) {
 	args := []string{
 		"interface", "ipv4", "show", "interfaces",
 	}
@@ -184,7 +236,13 @@ func (runner *runner) getNetworkInterfaceParameters() (map[string]int, error) {
 	}
 
 	// Split output by line
-	outputString := string(output[:])
+	var outputString string
+	if gbk {
+		outputString, err = simplifiedchinese.GBK.NewDecoder().String(string(output[:]))
+	} else {
+		outputString = string(output[:])
+	}
+
 	outputString = strings.TrimSpace(outputString)
 	var outputLines = strings.Split(outputString, "\n")
 
